@@ -1,0 +1,417 @@
+//this code is inspired by the excellent ModbusRTUSlave library by C. M. Bulliner
+//https://github.com/CMB27/ModbusRTUSlave
+
+#include "JKModbusSlave.h"
+
+namespace {
+constexpr uint32_t SPOOF_SOC_PERCENT = 100;
+constexpr uint32_t SPOOF_ENERGY_MWH = 15000000; // 15 kWh
+constexpr uint32_t SPOOF_CAPACITY_MAH = 304000; // 304 Ah
+
+constexpr uint16_t FRAME2_SOC_OFFSET = 190;
+constexpr uint16_t FRAME2_ENERGY_OFFSET = 194;
+constexpr uint16_t FRAME3_SOC_OFFSET = 238;
+constexpr uint16_t FRAME3_REMAINING_CAPACITY_OFFSET = 202;
+constexpr uint16_t FRAME3_TOTAL_CAPACITY_OFFSET = 218;
+
+// Accurate JK PB offsets
+constexpr uint16_t FRAME2_SOC_1BYTE_OFFSET = 167;
+constexpr uint16_t FRAME2_CAPACITY_REMAIN_OFFSET = 168;
+constexpr uint16_t FRAME2_CAPACITY_NOMINAL_OFFSET = 172;
+constexpr uint16_t FRAME2_CAPACITY_CELLINFO_OFFSET = 124;
+
+void writeUint32LE(uint8_t *frame, uint16_t offset, uint32_t value) {
+  frame[offset] = static_cast<uint8_t>(value & 0xFF);
+  frame[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  frame[offset + 2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  frame[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+}
+
+//settings frame responses from a 16S LiFe battery configured for address 0x04 (dip switch setting 4)
+uint8_t _frame_1_query[] = {0x04, 0x10, 0x16, 0x1E, 0x00, 0x01, 0x02, 0x00, 0x00, 0xED, 0x7F};
+uint8_t _frame1_response[] = {0x55, 0xAA, 0xEB, 0x90, 0x01, 0x05, 0xAC, 0x0D, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x5A, 0x0A, 0x00, 0x00, 0x10, 0x0E, 0x00, 0x00, 0x78, 0x0D, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x79, 0x0D, 0x00, 0x00, 0x50, 0x0A, 0x00, 0x00, 0x7A, 0x0D, 0x00, 0x00, 0x16, 0x0D, 0x00, 0x00, 0xC4, 0x09, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0xBC, 0x02, 0x00, 0x00, 0x58, 0x02, 0x00, 0x00, 0xBC, 0x02, 0x00, 0x00, 0x58, 0x02, 0x00, 0x00, 0x38, 0xFF, 0xFF, 0xFF, 0x9C, 0xFF, 0xFF, 0xFF, 0xE8, 0x03, 0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0xDC, 0x05, 0x00, 0x00, 0x48, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x04, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x60, 0xE3, 0x16, 0x00, 0x00, 0x02, 0x3C, 0x32, 0x18, 0xFE, 0xFF, 0xFF, 0xFF, 0x9F, 0xE9, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x04, 0x10, 0x16, 0x1E, 0x00, 0x01, 0x65, 0xD2};
+
+//status frame responses from a 16S LiFe battery configured for address 0x04 (dip switch setting 4)
+uint8_t _frame_2_query[] = {0x04, 0x10, 0x16, 0x20, 0x00, 0x01, 0x02, 0x00, 0x00, 0xE9, 0xA1};
+uint8_t _frame2_response[] = {0x55, 0xAA, 0xEB, 0x90, 0x02, 0x05, 0x0D, 0x0D, 0x0D, 0x0D, 0x0E, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0C, 0x0D, 0x0E, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0E, 0x0D, 0x0E, 0x0D, 0x0E, 0x0D, 0x0D, 0x0D, 0x0E, 0x0D, 0x0E, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x0D, 0x0D, 0x02, 0x00, 0x04, 0x07, 0x4A, 0x00, 0x49, 0x00, 0x4E, 0x00, 0x4C, 0x00, 0x50, 0x00, 0x49, 0x00, 0x4C, 0x00, 0x4A, 0x00, 0x4E, 0x00, 0x4A, 0x00, 0x4D, 0x00, 0x4B, 0x00, 0x50, 0x00, 0x4D, 0x00, 0x50, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2F, 0x01, 0x00, 0x00, 0x00, 0x00, 0xD5, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x05, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x1A, 0xD7, 0x8E, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x00, 0x9D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x40, 0x72, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0xE2, 0x14, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x92, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2F, 0x01, 0x12, 0x01, 0x12, 0x01, 0x9D, 0x03, 0x1F, 0xB6, 0x8E, 0x08, 0x8E, 0x00, 0x00, 0x00, 0x80, 0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0x7F, 0xDC, 0x2F, 0x01, 0x01, 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x04, 0x10, 0x16, 0x20, 0x00, 0x01, 0x04, 0x1E};
+
+//detailed status frame responses from a 16S LiFe battery configured for address 0x04 (dip switch setting 4). Only used by the JKBMS windows software
+uint8_t _frame_3_query[] = {0x04, 0x10, 0x16, 0x1C, 0x00, 0x01, 0x02, 0x00, 0x00, 0xEC, 0x9D};
+uint8_t _frame3_response[] = {0x55, 0xAA, 0xEB, 0x90, 0x03, 0x05, 0x4A, 0x4B, 0x5F, 0x50, 0x42, 0x32, 0x41, 0x31, 0x36, 0x53, 0x32, 0x30, 0x50, 0x00, 0x00, 0x00, 0x31, 0x35, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0x35, 0x2E, 0x32, 0x34, 0x00, 0x00, 0x00, 0x04, 0xD6, 0x8E, 0x00, 0x27, 0x00, 0x00, 0x00, 0x4A, 0x4B, 0x5F, 0x50, 0x42, 0x32, 0x41, 0x31, 0x36, 0x53, 0x32, 0x30, 0x50, 0x00, 0x00, 0x00, 0x31, 0x32, 0x33, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x34, 0x30, 0x32, 0x31, 0x39, 0x00, 0x00, 0x33, 0x31, 0x32, 0x31, 0x33, 0x34, 0x39, 0x30, 0x38, 0x39, 0x38, 0x00, 0x30, 0x30, 0x30, 0x00, 0x47, 0x68, 0x6F, 0x73, 0x74, 0x20, 0x42, 0x61, 0x74, 0x74, 0x65, 0x72, 0x79, 0x00, 0x00, 0x00, 0x33, 0x31, 0x34, 0x31, 0x35, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x8F, 0xE9, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x90, 0x1F, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xD8, 0xE7, 0xFE, 0x3F, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B, 0xCF, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDF, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xCF, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x08, 0x00, 0x01, 0x64, 0x00, 0x00, 0x00, 0x5F, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0x00, 0x0A, 0x0A, 0x01, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x9F, 0xE9, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x73, 0x04, 0x10, 0x16, 0x1C, 0x00, 0x01, 0xC4, 0x12};
+
+int JKPB_RS485_RESPONSE_SIZE = 308;
+
+//for more information about the data in these responses, see https://github.com/txubelaxu/esphome-jk-bms/blob/main/components/jk_rs485_bms/jk_rs485_bms.cpp
+
+
+JKModbusSlave::JKModbusSlave(HardwareSerial& serial, uint8_t dePin) {
+  _hardwareSerial = &serial;
+  #ifdef __AVR__
+  _softwareSerial = 0;
+  #endif
+  #ifdef HAVE_CDCSERIAL
+  _usbSerial = 0;
+  #endif
+  _serial = &serial;
+  _dePin = dePin;
+}
+
+#ifdef __AVR__
+JKModbusSlave::JKModbusSlave(SoftwareSerial& serial, uint8_t dePin) {
+  _hardwareSerial = 0;
+  _softwareSerial = &serial;
+  #ifdef HAVE_CDCSERIAL
+  _usbSerial = 0;
+  #endif
+  _serial = &serial;
+  _dePin = dePin;
+}
+#endif
+
+#ifdef HAVE_CDCSERIAL
+JKModbusSlave::JKModbusSlave(Serial_& serial, uint8_t dePin) {
+  _hardwareSerial = 0;
+  #ifdef __AVR__
+  _softwareSerial = 0;
+  #endif
+  _usbSerial = &serial;
+  _serial = &serial;
+  _dePin = dePin;
+}
+#endif
+
+#ifdef ESP32
+void JKModbusSlave::begin(uint8_t id, unsigned long baud, uint32_t config, int8_t rxPin, int8_t txPin, bool invert, bool JKBMS_LISTEN_ONLY, bool JKBMS_PRINT_DEBUG, bool JKBMS_PRINT_PASSTHROUGH) {
+  _JKBMS_LISTEN_ONLY = JKBMS_LISTEN_ONLY; //prevents board from transmitting over RS485
+  _JKBMS_PRINT_DEBUG = JKBMS_PRINT_DEBUG; //print buss traffic in a human readable form
+  _JKBMS_PRINT_PASSTHROUGH = JKBMS_PRINT_PASSTHROUGH; 
+   if(_JKBMS_PRINT_DEBUG){
+      Serial.print("Starting JKBMS ghost battery at address ");
+      Serial.println(id);
+  }
+  if (id >= 1 && id <= 247) _id = id;
+  else _id = NO_ID;
+  if (_hardwareSerial) {
+    _calculateTimeouts(baud, config);
+    _hardwareSerial->begin(baud, config, rxPin, txPin, invert);
+  }
+  #ifdef HAVE_CDCSERIAL
+  else if (_usbSerial) {
+    _calculateTimeouts(baud, config);
+    _usbSerial->begin(baud, config);
+    while (!_usbSerial);
+  }
+  #endif
+  if (_dePin != NO_DE_PIN) {
+    pinMode(_dePin, OUTPUT);
+    digitalWrite(_dePin, LOW);
+  }
+  _clearRxBuffer();
+}
+#else
+void JKModbusSlave::begin(uint8_t id, unsigned long baud, uint32_t config, bool JKBMS_LISTEN_ONLY, bool JKBMS_PRINT_DEBUG, bool JKBMS_PRINT_PASSTHROUGH) {
+  _JKBMS_LISTEN_ONLY = JKBMS_LISTEN_ONLY; //prevents board from transmitting over RS485
+  _JKBMS_PRINT_DEBUG = JKBMS_PRINT_DEBUG; //print buss traffic in a human readable form
+  _JKBMS_PRINT_PASSTHROUGH = JKBMS_PRINT_PASSTHROUGH; 
+  if(_JKBMS_PRINT_DEBUG){
+      Serial.print("Starting JKBMS ghost battery at address ");
+      Serial.println(id);
+  }
+  if (id >= 1 && id <= 247) _id = id;
+  else _id = NO_ID;
+  if (_hardwareSerial) {
+    _calculateTimeouts(baud, config);
+    _hardwareSerial->begin(baud, config);
+  }
+  #ifdef __AVR__
+  else if (_softwareSerial) {
+    _calculateTimeouts(baud, SERIAL_8N1);
+    _softwareSerial->begin(baud);
+  }
+  #endif
+  #ifdef HAVE_CDCSERIAL
+  else if (_usbSerial) {
+    _calculateTimeouts(baud, config);
+    _usbSerial->begin(baud, config);
+    while (!_usbSerial);
+  }
+  #endif
+  if (_dePin != NO_DE_PIN) {
+    pinMode(_dePin, OUTPUT);
+    digitalWrite(_dePin, LOW);
+  }
+  _clearRxBuffer();
+}
+#endif
+
+int16_t JKModbusSlave::poll() {
+  if (_serial->available()) {
+    if (_readRequest()) {
+      if(_buf[1] == 0x10){ //JKBMS start sequence byte 1
+        if(_buf[2] == 0x16){ //JKBMS start sequence byte 2
+            int16_t frame_type = _buf[3];
+            switch (frame_type) { //JKBMS frame type byte
+             case 0x1E:
+               if(_JKBMS_PRINT_DEBUG) Serial.println("settings request received");
+                _frame1();
+                break;
+              case 0x20:
+               if(_JKBMS_PRINT_DEBUG)  Serial.println("status request received");
+                _frame2();  
+                break;
+               case 0x1C:
+                if(_JKBMS_PRINT_DEBUG) Serial.println("detailed status request received");
+                _frame3();  
+                break;
+              default:
+                if(_JKBMS_PRINT_DEBUG) Serial.println("Unknown Command");
+                break;
+            }   
+            return frame_type; 
+         }   
+         return RESPONSE_ERROR; 
+      }
+      return RESPONSE_ERROR;  //error in decoding packet
+    }
+    return RESPONSE_NOT_MY_ADDRESS; //packet received, but not addressed to us
+  }
+  return RESPONSE_NO_DATA; //no packet received
+}
+
+
+void JKModbusSlave::_frame1() {
+    memcpy(_buf, _frame1_response, JKPB_RS485_RESPONSE_SIZE);
+
+    // [5] Patch address byte (template has 0x05 hardcoded from the captured battery)
+    _buf[5] = _id;
+
+    // [130-133] CapBatCell: design capacity in mAh (UINT32 LE)
+    //   Spec register 0x007C = offset 124 from register block start.
+    //   Packet offset = 6 (header) + 124 = 130.
+    //   Confirmed from real bat00 Frame 1: shows 314000 mAh at [130].
+    writeUint32LE(_buf, 130, SPOOF_CAPACITY_MAH);
+
+    _buf[299] = static_cast<uint8_t>(_chksum(299));
+    _writeResponse(JKPB_RS485_RESPONSE_SIZE);
+}
+
+void JKModbusSlave::_frame2() {
+    // Load the 308-byte template
+    memcpy(_buf, _frame2_response, 308);
+
+    // Clear bytes 100-280 to remove any stale junk (short-circuit flags,
+    // spurious current readings, etc.) from the captured template.
+    for (int i = 100; i <= 280; i++) _buf[i] = 0;
+
+    // --- Offsets verified from real JK PB V15 bus captures ---
+    // Packet layout: 6-byte header (55 AA EB 90 type addr) then register data.
+    // All multi-byte fields are Little-Endian.
+
+    // [5] Address: patch to our actual address.
+    //   The captured template has 0x05 hardcoded. Without this patch the master
+    //   sees every response as coming from bat05 and ignores/rejects it for bat04.
+    _buf[5] = _id;
+
+    // [150-153] BatVol: 53000 mV = 53.0 V (UINT32 LE)
+    //   Realistic 16S LiFePO4 at 100% SoC.
+    writeUint32LE(_buf, 150, 53000);
+
+    // [158-161] BatCurrent: 0 mA (INT32 LE) — ghost battery is idle
+    writeUint32LE(_buf, 158, 0);
+
+    // [166-169] Alarms: 0 — no faults
+    writeUint32LE(_buf, 166, 0);
+
+    // [173] SOCStateOfCharge: 100 % (UINT8)
+    //   Previously written to [167] which is an alarm byte — had no effect on SoC.
+    _buf[173] = 100;
+
+    // [174-177] SOCCapRemain: 304000 mAh = 304 Ah (INT32 LE)
+    //   Previously written to [146-149] which is CellWireResSta — wrong field.
+    writeUint32LE(_buf, 174, SPOOF_CAPACITY_MAH);
+
+    // [178-181] SOCFullChargeCap: 304000 mAh = 304 Ah (UINT32 LE)
+    //   Previously written to [142-145] which is also in the wire-resistance area.
+    writeUint32LE(_buf, 178, SPOOF_CAPACITY_MAH);
+
+    // [182-185] CycleCount: 10 (UINT32 LE)
+    //   Previously written to [150-153] which overwrote BatVol with 10 mV.
+    writeUint32LE(_buf, 182, 10);
+
+    // [190] SOCSOH: 100 % (UINT8)
+    _buf[190] = 100;
+
+    // [194-197] RunTime: fixed plausible value (UINT32 LE, seconds)
+    //   0 seconds looks suspicious. 24h 37m 14s = 88634 s gives a naturally
+    //   worn-in appearance without incrementing like the real batteries do.
+    writeUint32LE(_buf, 194, 88634);
+
+    // [198] ChargeStatus: 1 = on
+    // [199] DischargeStatus: 1 = on
+    //   These are zeroed by the clear loop. Real batteries send 0x01 for both.
+    //   The master suppresses capacity display for batteries showing as fully off.
+    _buf[198] = 1;
+    _buf[199] = 1;
+
+    // Checksum: low byte of the sum of bytes 0-298
+    _buf[299] = static_cast<uint8_t>(_chksum(299));
+
+    _writeResponse(308);
+}
+
+void JKModbusSlave::_frame3() {
+    memcpy(_buf, _frame3_response, JKPB_RS485_RESPONSE_SIZE);
+
+    // [5] Patch address byte
+    _buf[5] = _id;
+
+    // Device info frame: model/version strings only, no SOC or capacity fields.
+    _buf[299] = static_cast<uint8_t>(_chksum(299));
+    _writeResponse(JKPB_RS485_RESPONSE_SIZE);
+}
+
+
+bool JKModbusSlave::_readRequest() {
+  _numBytes = 0;
+  unsigned long startTime = 0;
+  _charTimeout = 10000; //increase timeout to get a full packet 
+  do {
+    if (_serial->available()) {
+      startTime = micros();
+      _buf[_numBytes] = _serial->read();
+      _numBytes++;
+    }
+  } while (micros() - startTime <= _charTimeout && _numBytes < MODBUS_RTU_SLAVE_BUF_SIZE);
+  while (micros() - startTime < _frameTimeout);
+  
+  if(_JKBMS_PRINT_DEBUG){
+      Serial.println("");
+      Serial.print("Packet received at ");
+      Serial.print(millis());
+      Serial.print(" ms, address = ");
+      if (_buf[0] <= 0x0F) Serial.print("0"); Serial.print(_buf[0], HEX);
+      Serial.print(", length = ");
+      Serial.print(_numBytes);
+      Serial.print(", CRC = ");
+      if (_buf[_numBytes - 2] <= 0x0F) Serial.print("0"); Serial.print(_buf[_numBytes -2], HEX);
+      Serial.print(" ");
+      if (_buf[_numBytes - 1] <= 0x0F) Serial.print("0"); Serial.print(_buf[_numBytes -1], HEX);
+      Serial.print(", (expected ");
+      if (lowByte(_crc(_numBytes - 2)) <= 0x0F) Serial.print("0"); Serial.print(lowByte(_crc(_numBytes - 2)), HEX);
+      Serial.print(" ");
+      if (highByte(_crc(_numBytes - 2)) <= 0x0F) Serial.print("0"); Serial.print(highByte(_crc(_numBytes - 2)), HEX);
+      Serial.println(")");
+      
+      Serial.print("RX: ");
+      for(int loop = 0; loop < _numBytes; loop++){
+        Serial.print("0x");
+        if (_buf[loop] <= 0x0F) Serial.print("0");
+        Serial.print(_buf[loop], HEX);
+        Serial.print(", ");
+      }
+      Serial.println("");
+  }
+  
+  //in passthrough mode, echo the recieved packets back through the USB port
+   if(_JKBMS_PRINT_PASSTHROUGH){
+      Serial.write(_buf, _numBytes);
+      _serial->flush();
+    }
+     
+  if (!_serial->available() && (_buf[0] == _id || _buf[0] == 0) && _crc(_numBytes - 2) == _bytesToWord(_buf[_numBytes - 1], _buf[_numBytes - 2])) return true;
+  else return false;
+}
+
+void JKModbusSlave::_writeResponse(uint16_t len) {
+  if (_buf[0] != 0) {
+    if (_dePin != NO_DE_PIN) digitalWrite(_dePin, HIGH);
+
+
+   //in actual operation the JKBMS sends bursts of ~100 characters followed by a few ms pause. 
+   //seding the whole packet at once seems to be decoded fine
+    if(!_JKBMS_LISTEN_ONLY){
+      _serial->write(_buf, len);
+      _serial->flush();
+    }
+    
+    if(_JKBMS_PRINT_DEBUG){
+      Serial.print("TX: ");
+      for(int loop = 0; loop < len; loop++){
+          Serial.print("0x");
+          if (_buf[loop] <= 0x0F) Serial.print("0");
+          Serial.print(_buf[loop], HEX);
+          Serial.print(", ");
+       }
+       Serial.println();
+     }
+
+    #ifdef ARDUINO_ARCH_RENESAS
+    delayMicroseconds(_flushCompensationDelay);
+    #endif
+    if (_dePin != NO_DE_PIN) digitalWrite(_dePin, LOW);
+    while(_serial->available()) {
+      _serial->read();
+    }
+  }
+}
+
+void JKModbusSlave::_clearRxBuffer() {
+  unsigned long startTime = micros();
+  do {
+    if (_serial->available()) {
+      startTime = micros();
+      _serial->read();
+    }
+  } while (micros() - startTime < _frameTimeout);
+}
+
+
+void JKModbusSlave::_calculateTimeouts(unsigned long baud, uint32_t config) {
+  unsigned long bitsPerChar;
+  if (config == SERIAL_8E2 || config == SERIAL_8O2) bitsPerChar = 12;
+  else if (config == SERIAL_8N2 || config == SERIAL_8E1 || config == SERIAL_8O1) bitsPerChar = 11;
+  else bitsPerChar = 10;
+  if (baud <= 19200) {
+    _charTimeout = (bitsPerChar * 2500000) / baud;
+    _frameTimeout = (bitsPerChar * 4500000) / baud;
+  }
+  else {
+    _charTimeout = (bitsPerChar * 1000000) / baud + 750;
+    _frameTimeout = (bitsPerChar * 1000000) / baud + 1750;
+  }
+  #ifdef ARDUINO_ARCH_RENESAS
+  _flushCompensationDelay = (bitsPerChar * 1000000) / baud;
+  #endif
+}
+
+uint16_t JKModbusSlave::_crc(uint16_t len) {
+  uint16_t value = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    value ^= (uint16_t)_buf[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      bool lsb = value & 1;
+      value >>= 1;
+      if (lsb) value ^= 0xA001;
+    }
+  }
+  return value;
+}
+
+
+uint16_t JKModbusSlave::_chksum(uint16_t len) {
+  uint16_t checksum = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    checksum = checksum + _buf[i];
+  }
+  return checksum;
+}
+
+
+uint16_t JKModbusSlave::_div8RndUp(uint16_t value) {
+  return (value + 7) >> 3;
+}
+
+uint16_t JKModbusSlave::_bytesToWord(uint8_t high, uint8_t low) {
+  return (high << 8) | low;
+}
