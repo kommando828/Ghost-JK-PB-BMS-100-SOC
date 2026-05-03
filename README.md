@@ -1,0 +1,2 @@
+# Ghost-JK-PB-BMS-100-SOC
+Ghost JK PB BMS 100% SOC
